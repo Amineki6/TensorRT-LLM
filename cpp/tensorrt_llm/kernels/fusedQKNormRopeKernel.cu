@@ -177,7 +177,8 @@ __global__ void fusedQKNormRopeKernel(
     // parameters for interleaved mRoPE (use_mrope=false -> plain RoPE, single position per token)
     bool use_mrope,     // Whether to use interleaved mRoPE position selection
     int mrope_section1, // mrope_section[1] (height); section 0 (temporal) is implied
-    int mrope_section2  // mrope_section[2] (width)
+    int mrope_section2, // mrope_section[2] (width)
+    bool apply_rope     // Whether to apply RoPE; when false, only QK norm is applied
 )
 {
     int const warpsPerBlock = blockDim.x / 32;
@@ -276,6 +277,13 @@ __global__ void fusedQKNormRopeKernel(
             elements[i] *= rms_rcp * (use_gemma ? (1.0f + weight) : weight);
         }
     }
+
+    if (!apply_rope)
+    {
+        storeHeadElements<OutT, numElemsPerThread, vecSize>(qkv_out, offsetThread, elements);
+        return;
+    }
+
     // Apply RoPE to normalized elements
     float elements2[numElemsPerThread]; // Additional buffer required for RoPE.
     float cos_vals[numElemsPerThread];
@@ -882,20 +890,23 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
     int const rotary_dim, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
     float const base, bool const interleave, int const* position_ids, float factor, float low, float high,
     float attention_factor, cudaStream_t stream, bool is_qk_norm, bool use_gemma, bool use_mrope, int mrope_section1,
-    int mrope_section2)
+    int mrope_section2, bool apply_rope)
 {
     if (factor == 1.0f)
     {
         TLLM_CHECK(attention_factor == 1.0f);
     }
 
-    TLLM_CHECK_WITH_INFO(rotary_dim > 0 && rotary_dim <= head_dim && rotary_dim % 2 == 0,
-        "rotary_dim must be positive, even and no greater than head_dim (got rotary_dim=%d, head_dim=%d)", rotary_dim,
-        head_dim);
+    if (apply_rope)
+    {
+        TLLM_CHECK_WITH_INFO(rotary_dim > 0 && rotary_dim <= head_dim && rotary_dim % 2 == 0,
+            "rotary_dim must be positive, even and no greater than head_dim (got rotary_dim=%d, head_dim=%d)",
+            rotary_dim, head_dim);
+    }
     // Skipping V leaves the output's V slots untouched, which is only meaningful in place.
     TLLM_CHECK_WITH_INFO(process_v || static_cast<void const*>(qkv_in) == static_cast<void const*>(qkv_out),
         "process_v=false requires qkv_in and qkv_out to alias");
-    if (!interleave)
+    if (apply_rope && !interleave)
     {
         // To allow warp-level pairing for partial rope
         TLLM_CHECK_WITH_INFO(
@@ -921,7 +932,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
             fusedQKNormRopeKernel<64, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
                 num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
                 num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-                mrope_section2);
+                mrope_section2, apply_rope);
         });
         break;
     case 128:
@@ -929,7 +940,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
             fusedQKNormRopeKernel<128, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
                 num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
                 num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-                mrope_section2);
+                mrope_section2, apply_rope);
         });
         break;
     case 256:
@@ -937,7 +948,7 @@ static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out
             fusedQKNormRopeKernel<256, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
                 num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
                 num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-                mrope_section2);
+                mrope_section2, apply_rope);
         });
         break;
     default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
@@ -948,13 +959,13 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     int const num_heads_v, int const head_dim, int const rotary_dim, float const eps, void const* q_weight,
     void const* k_weight, float const base, bool const interleave, int const* position_ids, float factor, float low,
     float high, float attention_factor, cudaStream_t stream, bool is_qk_norm, bool use_gemma, bool use_mrope,
-    int mrope_section1, int mrope_section2)
+    int mrope_section1, int mrope_section2, bool apply_rope)
 {
     launchFusedQKNormRopeImpl<__nv_bfloat16>(static_cast<__nv_bfloat16 const*>(qkv), static_cast<__nv_bfloat16*>(qkv),
         /*process_v=*/false, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim, rotary_dim, eps,
         static_cast<__nv_bfloat16 const*>(q_weight), static_cast<__nv_bfloat16 const*>(k_weight), base, interleave,
         position_ids, factor, low, high, attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1,
-        mrope_section2);
+        mrope_section2, apply_rope);
 }
 
 void launchFusedQKNormRopeToFp8(void const* qkv_in, void* qkv_out, int const num_tokens, int const num_heads_q,
@@ -968,7 +979,8 @@ void launchFusedQKNormRopeToFp8(void const* qkv_in, void* qkv_out, int const num
         static_cast<__nv_fp8_e4m3*>(qkv_out), /*process_v=*/true, num_tokens, num_heads_q, num_heads_k, num_heads_v,
         head_dim, rotary_dim, eps, static_cast<__nv_bfloat16 const*>(q_weight),
         static_cast<__nv_bfloat16 const*>(k_weight), base, interleave, position_ids, factor, low, high,
-        attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
+        attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2,
+        /*apply_rope=*/true);
 }
 
 void launchMinimaxM3Fp8QKNormRopeKVInsert(void const* qkv_input, void* q_output, void* kv_cache,

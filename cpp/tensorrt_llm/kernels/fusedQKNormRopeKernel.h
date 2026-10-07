@@ -51,7 +51,8 @@ void launchFusedQKNormRope(
     bool use_gemma,         // Whether QK norm uses Gemma-style RMSNorm (scale by (1 + weight))
     bool use_mrope,         // Whether to use interleaved mRoPE position selection
     int mrope_section1,     // mrope_section[1] (height)
-    int mrope_section2);    // mrope_section[2] (width)
+    int mrope_section2,     // mrope_section[2] (width)
+    bool apply_rope = true); // Whether to apply RoPE; when false, only QK norm is applied
 
 // Out-of-place FP8 variant of launchFusedQKNormRope, folding the FP8
 // activation-quant into the norm+RoPE epilogue. Q and K get RMSNorm + RoPE; V is

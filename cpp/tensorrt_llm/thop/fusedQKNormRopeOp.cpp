@@ -159,7 +159,8 @@ void fused_qk_norm_rope(
     bool use_gemma,          // Whether QK norm uses Gemma-style RMSNorm (scale by (1 + weight))
     bool use_mrope,          // Whether to use interleaved mRoPE position selection
     int64_t mrope_section1,  // mrope_section[1] (height); ignored when use_mrope is false
-    int64_t mrope_section2   // mrope_section[2] (width)
+    int64_t mrope_section2,  // mrope_section[2] (width)
+    bool apply_rope          // Whether to apply RoPE; when false, only QK norm is applied
 )
 {
     int64_t num_tokens = validateFusedQKNormRopeInputs(
@@ -175,7 +176,7 @@ void fused_qk_norm_rope(
         !is_neox, // interleave
         reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<float>(factor), static_cast<float>(low),
         static_cast<float>(high), static_cast<float>(attention_factor), stream, is_qk_norm, use_gemma, use_mrope,
-        static_cast<int>(mrope_section1), static_cast<int>(mrope_section2));
+        static_cast<int>(mrope_section1), static_cast<int>(mrope_section2), apply_rope);
 }
 
 // Out-of-place FP8 variant of fused_qk_norm_rope: applies RMSNorm + RoPE to Q/K,
@@ -472,7 +473,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "rotary_dim, float "
         "eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids, float factor, float "
         "low, float high, float attention_factor, bool is_qk_norm, bool use_gemma, bool use_mrope, int "
-        "mrope_section1, int mrope_section2) -> ()");
+        "mrope_section1, int mrope_section2, bool apply_rope=True) -> ()");
     m.def(
         "fused_qk_norm_rope_to_fp8(Tensor qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, int "
         "rotary_dim, float eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids, float "

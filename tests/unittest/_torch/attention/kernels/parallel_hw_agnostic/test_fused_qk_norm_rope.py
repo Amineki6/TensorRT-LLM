@@ -317,6 +317,68 @@ def test_fused_qk_norm_rope(
     )
 
 
+@pytest.mark.parametrize("head_dim", head_dims)
+@pytest.mark.parametrize("num_heads_group", [(16, 8, 8), (32, 8, 8)])
+@pytest.mark.parametrize("num_tokens", [1, 3, 256])
+@pytest.mark.parametrize("use_gemma", [False, True])
+@torch.inference_mode()
+def test_fused_qk_norm_without_rope(head_dim, num_heads_group, num_tokens, use_gemma):
+    """With apply_rope=False the op applies only per-head RMSNorm to Q and K."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_heads_q, num_heads_k, num_heads_v = num_heads_group
+    q_size = num_heads_q * head_dim
+    k_size = num_heads_k * head_dim
+    hidden_size = q_size + k_size + num_heads_v * head_dim
+
+    torch.random.manual_seed(0)
+    qkv = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    qkv_copy = qkv.clone()
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device) + 100
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device) * 5.0
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device) * 5.0
+    eps = 1e-5
+
+    # RoPE arguments are deliberately invalid (rotary_dim=0, base=0) to check
+    # that they are neither validated nor used when apply_rope=False.
+    torch.ops.trtllm.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        0,  # rotary_dim
+        eps,
+        q_weight,
+        k_weight,
+        0.0,  # base
+        True,  # is_neox
+        position_ids,
+        1.0,  # factor
+        0.0,  # low
+        0.0,  # high
+        1.0,  # attention_factor
+        True,  # is_qk_norm
+        use_gemma,
+        False,  # use_mrope
+        0,  # mrope_section1
+        0,  # mrope_section2
+        apply_rope=False,
+    )
+
+    q_norm = RMSNorm(hidden_size=head_dim, eps=eps, use_gemma=use_gemma).to(device).to(dtype)
+    k_norm = RMSNorm(hidden_size=head_dim, eps=eps, use_gemma=use_gemma).to(device).to(dtype)
+    q_norm.weight.data.copy_(q_weight)
+    k_norm.weight.data.copy_(k_weight)
+    q_ref = q_norm(qkv_copy[:, :q_size].reshape(-1, head_dim)).reshape(num_tokens, q_size)
+    k_ref = k_norm(qkv_copy[:, q_size : q_size + k_size].reshape(-1, head_dim)).reshape(
+        num_tokens, k_size
+    )
+    ref_output = torch.cat([q_ref, k_ref, qkv_copy[:, q_size + k_size :]], dim=1)
+
+    torch.testing.assert_close(qkv, ref_output, rtol=5e-2, atol=1e-1)
+
+
 @torch.inference_mode()
 def torch_ref_gemma_mrope(
     qkv,

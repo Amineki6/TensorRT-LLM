@@ -12,3 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from .kolibri_router_custom_op import (fused_kolibri_router,
+                                       is_kolibri_router_available)
+
+__all__ = [
+    'fused_kolibri_router',
+    'is_kolibri_router_available',
+]

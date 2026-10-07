@@ -32,6 +32,8 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.moe.custom_ops.kolibri_router_custom_op import (
+    fused_kolibri_router, is_kolibri_router_available)
 from tensorrt_llm._torch.moe.fused_moe import BaseMoeRoutingMethod, RoutingMethodType, create_moe
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.utils import AuxStreamType
@@ -86,8 +88,17 @@ class Kolibri1RoutingMethod(BaseMoeRoutingMethod):
         router_logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits = router_logits.float()
         bias = self.e_score_correction_bias
+        if router_logits.is_cuda and is_kolibri_router_available():
+            return fused_kolibri_router(
+                x=router_logits,
+                bias=bias,
+                k=self.top_k,
+                norm_topk_prob=self.norm_topk_prob,
+                output_dtype=self.output_dtype,
+            )
+
+        logits = router_logits.float()
         scores = (logits + bias) if bias is not None else logits
         _, topk_ids = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
         topk_weights = torch.sigmoid(logits.gather(dim=-1, index=topk_ids))
@@ -123,12 +134,10 @@ class Kolibri1Attention(QKNormRoPEAttention):
             None if self.is_full_attention else getattr(config, "sliding_window", None)
         )
 
-        pos_embd_params = None
-        if not self.is_full_attention:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
+        pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gpt_neox,
+            rope=RopeParams.from_config(config),
+        )
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -138,7 +147,7 @@ class Kolibri1Attention(QKNormRoPEAttention):
             bias=False,
             pos_embd_params=pos_embd_params,
             skip_rope=self.is_full_attention,
-            fuse_qk_norm_rope=False,
+            fuse_qk_norm_rope=True,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,

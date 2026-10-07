@@ -24,16 +24,16 @@ def tiny_kolibri_config():
     """Create a minimal Kolibri1Config for testing."""
     return Kolibri1Config(
         vocab_size=256,
-        hidden_size=64,
-        intermediate_size=32,
+        hidden_size=256,
+        intermediate_size=128,
         num_hidden_layers=5,  # 4 SWA + 1 Full Attention
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=16,
+        head_dim=64,
         sliding_window=64,
         num_experts=8,
         num_experts_per_tok=2,
-        moe_intermediate_size=32,
+        moe_intermediate_size=64,
         shared_expert_intermediate_size=64,
     )
 
@@ -182,18 +182,17 @@ def test_kolibri_causal_lm_load_weights_hook():
         "model.layers.0.shared_experts.gate_proj.weight": torch.zeros(512, 2560),
     }
 
-    with patch.object(Kolibri1ForCausalLM, "__init__", return_value=None):
-        model = Kolibri1ForCausalLM(MagicMock())
-        with patch(
-            "tensorrt_llm._torch.models.modeling_speculative.SpecDecOneEngineForCausalLM.load_weights"
-        ) as mock_super_load:
-            model.load_weights(raw_weights, weight_mapper=mapper)
-            assert mock_super_load.called
-            call_kwargs = mock_super_load.call_args.kwargs
-            forwarded_weights = call_kwargs["weights"]
-            assert "model.layers.0.mlp.gate.e_score_correction_bias" in forwarded_weights
-            assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in forwarded_weights
-            assert call_kwargs["params_map"] == mapper.params_map
+    model = object.__new__(Kolibri1ForCausalLM)
+    with patch(
+        "tensorrt_llm._torch.models.modeling_speculative.SpecDecOneEngineForCausalLM.load_weights"
+    ) as mock_super_load:
+        model.load_weights(raw_weights, weight_mapper=mapper)
+        assert mock_super_load.called
+        call_kwargs = mock_super_load.call_args.kwargs
+        forwarded_weights = call_kwargs["weights"]
+        assert "model.layers.0.mlp.gate.e_score_correction_bias" in forwarded_weights
+        assert "model.layers.0.mlp.shared_experts.gate_proj.weight" in forwarded_weights
+        assert call_kwargs["params_map"] == mapper.params_map
 
 
 @pytest.mark.cpu_only
@@ -206,6 +205,104 @@ def test_kolibri_auto_checkpoint_mapper():
 
     mapper = AutoCheckpointMapper.get("HF", "Kolibri1ForCausalLM")
     assert isinstance(mapper, checkpoints.Kolibri1HfWeightMapper)
+
+
+@pytest.mark.cpu_only
+def test_kolibri_attention_fused_zero_position_bypass(tiny_kolibri_config):
+    """Test Option 2: all layers enable fused QK-Norm RoPE kernel with zero-position bypass on full-attention."""
+    from unittest.mock import MagicMock, patch
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_kolibri import Kolibri1Attention
+
+    model_config = ModelConfig(pretrained_config=tiny_kolibri_config)
+
+    # All layers initialize with fuse_qk_norm_rope = True and skip_rope = False
+    attn_swa = Kolibri1Attention(model_config=model_config, layer_idx=0)
+    assert not attn_swa.is_full_attention
+    assert attn_swa.fuse_qk_norm_rope is True
+    assert attn_swa.skip_rope is False
+
+    attn_full = Kolibri1Attention(model_config=model_config, layer_idx=4)
+    assert attn_full.is_full_attention
+    assert attn_full.fuse_qk_norm_rope is True
+    assert attn_full.skip_rope is False
+
+    # In forward(), full-attention layers clamp position_ids to zero for identity RoPE (R=I)
+    dummy_pos = torch.tensor([[10, 20, 30]], dtype=torch.int32)
+    with patch("tensorrt_llm._torch.attention.qk_norm_attention.QKNormRoPEAttention.forward") as mock_super_forward:
+        mock_super_forward.return_value = torch.zeros(1)
+        attn_full.forward(
+            position_ids=dummy_pos,
+            hidden_states=torch.zeros(1),
+            attn_metadata=MagicMock(),
+        )
+        assert mock_super_forward.called
+        forwarded_pos = mock_super_forward.call_args.kwargs["position_ids"]
+        assert torch.all(forwarded_pos == 0)
+
+    # Sliding-window layers retain original position_ids
+    with patch("tensorrt_llm._torch.attention.qk_norm_attention.QKNormRoPEAttention.forward") as mock_super_forward:
+        mock_super_forward.return_value = torch.zeros(1)
+        attn_swa.forward(
+            position_ids=dummy_pos,
+            hidden_states=torch.zeros(1),
+            attn_metadata=MagicMock(),
+        )
+        assert mock_super_forward.called
+        forwarded_pos = mock_super_forward.call_args.kwargs["position_ids"]
+        assert torch.equal(forwarded_pos, dummy_pos)
+
+
+@pytest.mark.cpu_only
+def test_kolibri_router_custom_op_availability():
+    """Test is_kolibri_router_available probe and CPU fallback."""
+    from tensorrt_llm._torch.models.modeling_kolibri import Kolibri1RoutingMethod
+    from tensorrt_llm._torch.moe.custom_ops.kolibri_router_custom_op import (
+        is_kolibri_router_available,
+    )
+
+    avail = is_kolibri_router_available()
+    assert isinstance(avail, bool)
+
+    # CPU input should always use eager fallback seamlessly
+    routing = Kolibri1RoutingMethod(top_k=2, num_experts=8)
+    logits = torch.randn(2, 8)
+    ids, weights = routing.apply(logits)
+    assert ids.shape == (2, 2)
+    assert weights.shape == (2, 2)
+    assert ids.dtype == torch.int32
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Requires CUDA GPU",
+)
+def test_fused_kolibri_router_cuda_parity():
+    """Test numerical parity between fused Triton router and eager PyTorch on CUDA."""
+    from tensorrt_llm._torch.moe.custom_ops.kolibri_router_custom_op import (
+        fused_kolibri_router,
+        is_kolibri_router_available,
+    )
+
+    if not is_kolibri_router_available():
+        pytest.skip("Triton Kolibri router not available")
+
+    torch.manual_seed(42)
+    b, e, k = 4, 384, 6
+    x = torch.randn(b, e, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(e, device="cuda", dtype=torch.float32)
+
+    # PyTorch eager reference
+    scores = x.float() + bias
+    _, expected_ids = torch.topk(scores, k=k, dim=-1, sorted=False)
+
+    # Fused Triton kernel
+    ids, weights = fused_kolibri_router(x, bias=bias, k=k, output_dtype=torch.float32)
+
+    for row in range(b):
+        ref_set = set(expected_ids[row].tolist())
+        triton_set = set(ids[row].tolist())
+        assert ref_set == triton_set
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
@@ -234,7 +331,11 @@ def test_kolibri_e2e_dummy_forward(tiny_kolibri_config):
         outputs = llm.generate(
             [[1, 2, 3, 4, 5]],
             sampling_params=SamplingParams(
-                max_tokens=4, ignore_eos=True, detokenize=False),
+                max_tokens=4,
+                ignore_eos=True,
+                detokenize=False,
+                end_id=tiny_kolibri_config.eos_token_id,
+            ),
         )
         assert len(outputs) == 1
         assert len(outputs[0].outputs[0].token_ids) == 4

@@ -181,8 +181,6 @@ class QKNormRoPEAttention(Attention):
         rope_fusion &= (not self.fuse_qk_norm_rope and not skip_rope
                         and not attn_output_gate and not use_gemma_rms_norm)
         self.is_qk_norm = is_qk_norm
-        assert not (fuse_qk_norm_rope and skip_rope
-                    ), "Fusing qk norm and skipping rope is not supported"
 
         super().__init__(
             hidden_size=hidden_size,
@@ -319,10 +317,17 @@ class QKNormRoPEAttention(Attention):
         return q, k
 
     def apply_qk_norm_rope(self, qkv, position_ids):
-        factor, low, high, attention_factor = compute_yarn_parameters(
-            self.pretrained_config)
-
         rotary_dim = self._get_qk_norm_rotary_dim()
+        if self.skip_rope:
+            # Unused by the kernel when apply_rope=False; pos_embd_params may
+            # be None on layers that skip RoPE.
+            factor, low, high, attention_factor = 1.0, 0.0, 0.0, 1.0
+            theta, is_neox = 0.0, True
+        else:
+            factor, low, high, attention_factor = compute_yarn_parameters(
+                self.pretrained_config)
+            theta = self.pos_embd_params.rope.theta
+            is_neox = self.pos_embd_params.is_neox
 
         # Interleaved mRoPE: position_ids is 3D [3, ...] (temporal/height/width)
         # and each rotary half-dim picks a section per
@@ -348,10 +353,10 @@ class QKNormRoPEAttention(Attention):
             qkv, self.num_heads, self.num_key_value_heads,
             self.num_key_value_heads, self.head_dim, rotary_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight, self.pos_embd_params.rope.theta,
-            self.pos_embd_params.is_neox, position_ids_arg, factor, low, high,
-            attention_factor, self.is_qk_norm, self.use_gemma_rms_norm,
-            use_mrope, mrope_section1, mrope_section2)
+            self.k_norm.weight, theta, is_neox, position_ids_arg, factor, low,
+            high, attention_factor, self.is_qk_norm, self.use_gemma_rms_norm,
+            use_mrope, mrope_section1, mrope_section2,
+            apply_rope=not self.skip_rope)
         return qkv, None, None
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
